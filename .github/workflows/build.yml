@@ -16,11 +16,15 @@ on:
       upstream_ref:
         description: "Branch/tag/commit do upstream (fixe um commit p/ build reprodutível)"
         default: android
+      build_cmd:
+        description: "Comando de build (vazio = só inventário). Roda dentro da pasta do upstream."
+        default: ""
 
 env:
   UPSTREAM_REPO: https://github.com/simfeo/blender.git
   PROFILE: ${{ inputs.profile || 'lite' }}
   UPSTREAM_REF: ${{ inputs.upstream_ref || 'android' }}
+  BUILD_CMD: ${{ inputs.build_cmd || vars.ATLAS_BUILD_CMD }}
 
 jobs:
   build:
@@ -67,19 +71,34 @@ jobs:
 
       - name: Clonar upstream (com submódulos; LFS tolerante)
         env:
-          GIT_LFS_SKIP_SMUDGE: "1"   # não falhar o checkout se um objeto LFS (404) não existir no servidor
+          GIT_LFS_SKIP_SMUDGE: "1"
         run: |
+          mkdir -p inventory
           git clone "$UPSTREAM_REPO" upstream
           cd upstream
           git checkout "$UPSTREAM_REF"
           git submodule update --init --recursive --depth 1
           git rev-parse HEAD | tee ../UPSTREAM_COMMIT.txt
-          mkdir -p ../inventory
-          echo "== tentando baixar objetos LFS (falhas não interrompem) =="
-          GIT_LFS_SKIP_SMUDGE=0 git lfs pull 2>&1 | tail -40 || true
-          # lista: '*' = baixado, '-' = apenas ponteiro (objeto ausente)
+          { echo "== .lfsconfig"; cat .lfsconfig 2>/dev/null || echo "(nenhum)"; echo; echo "== git lfs env"; git lfs env 2>&1; } > ../inventory/lfs-config.txt || true
+
+      - name: Baixar objetos LFS necessários (sem tests/)
+        working-directory: upstream
+        run: |
+          INC="release/*,assets/*,scripts/*,doc/*"
+          echo "== tentativa 1: servidor LFS padrão =="
+          GIT_LFS_SKIP_SMUDGE=0 git lfs pull --include="$INC" 2>&1 | tail -15 || true
+          MISSING=$(git lfs ls-files | grep -E ' - (release|assets|scripts)/' | wc -l || true)
+          echo "ausentes após tentativa 1: $MISSING"
+          if [ "$MISSING" -gt 0 ]; then
+            echo "== tentativa 2: servidor LFS do projeto Blender =="
+            git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+            GIT_LFS_SKIP_SMUDGE=0 git lfs pull --include="$INC" 2>&1 | tail -15 || true
+            MISSING=$(git lfs ls-files | grep -E ' - (release|assets|scripts)/' | wc -l || true)
+            echo "ausentes após tentativa 2: $MISSING"
+          fi
           git lfs ls-files > ../inventory/lfs-files.txt 2>&1 || true
-          echo "LFS ausentes (ponteiros):"; grep -c ' - ' ../inventory/lfs-files.txt || true
+          git lfs ls-files | grep -E ' - (release|assets|scripts)/' > ../inventory/lfs-missing-needed.txt || true
+          echo "MISSING_NEEDED=$MISSING" >> "$GITHUB_ENV"
 
       - name: Aplicar patches Atlas (do .zip)
         run: |
@@ -101,6 +120,9 @@ jobs:
           ls .github/workflows 2>/dev/null > ../inventory/upstream-workflows.txt || true
           for f in README.md ANDROID*.md android/README.md; do [ -f "$f" ] && { echo "=== $f"; cat "$f"; } >> ../inventory/android-docs.txt; done || true
           cat .github/workflows/*android* >> ../inventory/upstream-android-workflow.txt 2>/dev/null || true
+          for f in build_files/android/README.md build_files/android/BUILDING.md build_files/android/env.sh build_files/android/configure.sh build_files/android/build_apk.sh build_files/android/apk/package.sh; do
+            [ -f "$f" ] && { echo; echo "=================== $f"; head -c 30000 "$f"; } >> ../inventory/android-build-docs.txt
+          done || true
 
       - name: Publicar inventário
         if: always()
@@ -116,24 +138,26 @@ jobs:
           key: ccache-${{ env.PROFILE }}-${{ github.sha }}
           restore-keys: ccache-${{ env.PROFILE }}-
 
-      - name: Build (variável do repositório ATLAS_BUILD_CMD)
-        if: ${{ vars.ATLAS_BUILD_CMD != '' }}
+      - name: Build (input build_cmd ou variável ATLAS_BUILD_CMD)
+        if: ${{ env.BUILD_CMD != '' }}
         working-directory: upstream
         env:
           ATLAS_PROFILE: ${{ env.PROFILE }}
         run: |
           sudo apt-get update && sudo apt-get install -y ninja-build ccache
           export CCACHE_DIR="$HOME/.cache/ccache"
-          bash -c "${{ vars.ATLAS_BUILD_CMD }}"
+          echo "Executando: $BUILD_CMD"
+          bash -c "$BUILD_CMD"
 
-      - name: Aviso — comando de build ainda não definido
-        if: ${{ vars.ATLAS_BUILD_CMD == '' }}
-        run: echo "::notice::Defina a variável ATLAS_BUILD_CMD após ler o artefato atlas-inventory."
+      - name: Aviso — comando de build não informado
+        if: ${{ env.BUILD_CMD == '' }}
+        run: echo "::notice::Rode de novo informando build_cmd (ou defina ATLAS_BUILD_CMD). Veja atlas-inventory/android-build-docs.txt."
 
       - name: Publicar APKs
-        if: ${{ vars.ATLAS_BUILD_CMD != '' }}
+        if: ${{ env.BUILD_CMD != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: atlas-apk-${{ env.PROFILE }}
           path: upstream/**/*.apk
           if-no-files-found: error
+          
