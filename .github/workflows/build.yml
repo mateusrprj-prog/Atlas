@@ -137,4 +137,3 @@ jobs:
           name: atlas-apk-${{ env.PROFILE }}
           path: upstream/**/*.apk
           if-no-files-found: error
-          a
