@@ -30,7 +30,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: Checkout do repositório
@@ -68,17 +68,25 @@ jobs:
           cmake --version | head -1; gcc-14 --version 2>/dev/null | head -1 || gcc-15 --version | head -1
           git lfs install
 
-      - name: Android SDK + NDK exatos do porte
+      - name: Android SDK + NDK r30
         run: |
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
           # env.sh do porte espera o SDK em $HOME/android-sdk
           [ -e "$HOME/android-sdk" ] || ln -s "$SDK" "$HOME/android-sdk"
-          yes | "$SM" --licenses >/dev/null || true
-          PKGS=("ndk;$NDK_VER" "platform-tools" "build-tools;35.0.1" "platforms;android-35")
-          "$SM" "${PKGS[@]}" || "$SM" --channel=3 "${PKGS[@]}" || sudo "$SM" --channel=3 "${PKGS[@]}"
+          set +o pipefail
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" --list --channel=3 2>/dev/null | grep -i 'ndk;' > inventory/ndk-all.txt || true
+          CANDS=$(grep -oE 'ndk;3[0-9]\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+)?' inventory/ndk-all.txt | sed 's/^ndk;//' | sort -u)
+          echo "NDK 30+ disponíveis:"; echo "$CANDS"
+          if echo "$CANDS" | grep -qx "$NDK_VER"; then PICK="$NDK_VER"; else PICK=$(echo "$CANDS" | sort -V | tail -1); fi
+          if [ -z "$PICK" ]; then echo "::error::Nenhum NDK r30+ encontrado (veja atlas-inventory/ndk-all.txt)"; exit 1; fi
+          echo "NDK escolhido: $PICK (pedido pelo porte: $NDK_VER)"
+          PKGS=("ndk;$PICK" "platform-tools" "build-tools;35.0.1" "platforms;android-35")
+          "$SM" --channel=3 "${PKGS[@]}" || sudo "$SM" --channel=3 "${PKGS[@]}"
+          test -d "$HOME/android-sdk/ndk/$PICK"
+          echo "ANDROID_NDK_VERSION=$PICK" >> "$GITHUB_ENV"
           ls "$HOME/android-sdk/ndk" "$HOME/android-sdk/build-tools"
-          test -d "$HOME/android-sdk/ndk/$NDK_VER"
 
       - name: Clonar upstream
         env:
@@ -128,6 +136,9 @@ jobs:
           tar -xzf /tmp/vh.tar.gz -C /tmp
           mkdir -p blender_build_android/lib/vulkan_headers
           cp -R "/tmp/Vulkan-Headers-$VER/include" blender_build_android/lib/vulkan_headers/include
+
+      - name: Preparar pasta do ccache
+        run: mkdir -p "$HOME/.cache/ccache"
 
       - name: Restaurar cache do compilador (ccache)
         uses: actions/cache/restore@v4
