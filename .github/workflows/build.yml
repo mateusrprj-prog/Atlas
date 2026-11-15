@@ -65,13 +65,21 @@ jobs:
           echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$SDK/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
 
-      - name: Clonar upstream (com submódulos)
+      - name: Clonar upstream (com submódulos; LFS tolerante)
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"   # não falhar o checkout se um objeto LFS (404) não existir no servidor
         run: |
           git clone "$UPSTREAM_REPO" upstream
           cd upstream
           git checkout "$UPSTREAM_REF"
           git submodule update --init --recursive --depth 1
           git rev-parse HEAD | tee ../UPSTREAM_COMMIT.txt
+          mkdir -p ../inventory
+          echo "== tentando baixar objetos LFS (falhas não interrompem) =="
+          GIT_LFS_SKIP_SMUDGE=0 git lfs pull 2>&1 | tail -40 || true
+          # lista: '*' = baixado, '-' = apenas ponteiro (objeto ausente)
+          git lfs ls-files > ../inventory/lfs-files.txt 2>&1 || true
+          echo "LFS ausentes (ponteiros):"; grep -c ' - ' ../inventory/lfs-files.txt || true
 
       - name: Aplicar patches Atlas (do .zip)
         run: |
@@ -95,6 +103,7 @@ jobs:
           cat .github/workflows/*android* >> ../inventory/upstream-android-workflow.txt 2>/dev/null || true
 
       - name: Publicar inventário
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: atlas-inventory
@@ -128,4 +137,4 @@ jobs:
           name: atlas-apk-${{ env.PROFILE }}
           path: upstream/**/*.apk
           if-no-files-found: error
-          
+          a
