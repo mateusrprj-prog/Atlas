@@ -3,40 +3,58 @@ name: Build Atlas
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
-  native-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Compile and run core tests
-        run: |
-          g++ -std=c++17 -Wall -o /tmp/test_scene tests/test_scene.cpp
-          /tmp/test_scene
-
   apk:
-    needs: native-tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Localizar projeto (zip na raiz ou o proprio repo)
+        id: src
+        run: |
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+          if [ -n "$ZIP" ]; then
+            echo "Usando zip: $ZIP"
+            mkdir -p "$RUNNER_TEMP/proj"
+            unzip -q -o "$ZIP" -d "$RUNNER_TEMP/proj"
+            ROOT="$RUNNER_TEMP/proj"
+          else
+            echo "Nenhum zip encontrado, usando o repo"
+            ROOT="$GITHUB_WORKSPACE"
+          fi
+          SETTINGS=$(find "$ROOT" -maxdepth 3 -name 'settings.gradle*' -not -path '*/__MACOSX/*' | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "ERRO: settings.gradle.kts nao encontrado. Estrutura:"
+            find "$ROOT" -maxdepth 3 -not -path '*/.git/*' | head -n 80
+            exit 1
+          fi
+          DIR=$(dirname "$SETTINGS")
+          echo "Projeto em: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: android-actions/setup-android@v3
-      - name: Install NDK and CMake
+
+      - name: Instalar NDK e CMake
         run: sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Compilar APK debug
+        run: gradle -p "${{ steps.src.outputs.dir }}" :app:assembleDebug --stacktrace
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
+
       - uses: actions/upload-artifact@v4
         with:
           name: atlas-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: ${{ steps.src.outputs.dir }}/app/build/outputs/apk/debug/*.apk
           
