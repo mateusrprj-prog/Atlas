@@ -65,6 +65,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build patchelf zip unzip git-lfs ccache python3 curl
           sudo apt-get install -y gcc-14 g++-14 || sudo apt-get install -y gcc-15 g++-15
+          # o sub-build "host_tools" (dentro do build alvo) configura sem HEADLESS e exige cabeçalhos X11
+          sudo apt-get install -y libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev libxfixes-dev libxrender-dev
+          sudo apt-get install -y libxkbcommon-dev libdbus-1-dev libwayland-dev wayland-protocols libegl-dev libgl-dev || true
           cmake --version | head -1; gcc-14 --version 2>/dev/null | head -1 || gcc-15 --version | head -1
           git lfs install
 
