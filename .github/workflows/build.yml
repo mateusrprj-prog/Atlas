@@ -1,0 +1,131 @@
+name: Atlas Android Build
+
+# Pega QUALQUER .zip na raiz do repositório (o mais recente), extrai e usa como camada Atlas
+# (patches/, docs, scripts) sobre o porte do Blender para Android.
+
+on:
+  push:
+    paths: ['*.zip']
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Perfil (lite = leve, full = Cycles/USD/vídeo etc.)"
+        type: choice
+        options: [lite, full]
+        default: lite
+      upstream_ref:
+        description: "Branch/tag/commit do upstream (fixe um commit p/ build reprodutível)"
+        default: android
+
+env:
+  UPSTREAM_REPO: https://github.com/simfeo/blender.git
+  PROFILE: ${{ inputs.profile || 'lite' }}
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'android' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Localizar e extrair o .zip (qualquer nome)
+        run: |
+          ZIP=$(ls -t ./*.zip 2>/dev/null | head -1 || true)
+          if [ -z "$ZIP" ]; then echo "::error::Nenhum .zip na raiz do repositório. Envie o zip do projeto."; exit 1; fi
+          echo "Usando: $ZIP"
+          rm -rf atlas_src && mkdir atlas_src && unzip -q -o "$ZIP" -d atlas_src
+          MARK=$(find atlas_src -name ATLAS-Contexto.md | head -1 || true)
+          if [ -n "$MARK" ]; then ROOT=$(dirname "$MARK"); else ROOT=atlas_src; fi
+          echo "ATLAS_ROOT=$(realpath "$ROOT")" >> "$GITHUB_ENV"
+          echo "Raiz do projeto Atlas: $ROOT"; ls "$ROOT"
+
+      - name: Liberar espaço em disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar NDK r30+ (o mais novo disponível)
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses >/dev/null || true
+          NDK=$("$SM" --list 2>/dev/null | grep -o 'ndk;[0-9.]*' | sort -V | tail -1)
+          echo "NDK escolhido: $NDK"
+          case "$NDK" in ndk\;3[0-9]*|ndk\;[4-9][0-9]*) ;; *) echo "::error::NDK r30+ não encontrado ($NDK)"; exit 1;; esac
+          "$SM" "$NDK"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
+
+      - name: Clonar upstream (com submódulos)
+        run: |
+          git clone "$UPSTREAM_REPO" upstream
+          cd upstream
+          git checkout "$UPSTREAM_REF"
+          git submodule update --init --recursive --depth 1
+          git rev-parse HEAD | tee ../UPSTREAM_COMMIT.txt
+
+      - name: Aplicar patches Atlas (do .zip)
+        run: |
+          shopt -s nullglob
+          for p in "$ATLAS_ROOT"/patches/*.patch; do
+            echo ">> aplicando $(basename "$p")"
+            git -C upstream apply --index "$p"
+          done
+          echo "patches concluídos."
+
+      - name: Inventário de build (docs/scripts do porte)
+        run: |
+          mkdir -p inventory
+          cp UPSTREAM_COMMIT.txt inventory/
+          cd upstream
+          { echo "## arquivos android relevantes"; \
+            find . -ipath '*android*' \( -name '*.md' -o -name '*.sh' -o -name 'CMakeLists.txt' -o -name 'build.gradle*' -o -name 'settings.gradle*' -o -name '*.yml' \) \
+              -not -path './lib/*' -not -path './.git/*' | head -200; } > ../inventory/android-files.txt
+          ls .github/workflows 2>/dev/null > ../inventory/upstream-workflows.txt || true
+          for f in README.md ANDROID*.md android/README.md; do [ -f "$f" ] && { echo "=== $f"; cat "$f"; } >> ../inventory/android-docs.txt; done || true
+          cat .github/workflows/*android* >> ../inventory/upstream-android-workflow.txt 2>/dev/null || true
+
+      - name: Publicar inventário
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-inventory
+          path: inventory/
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ env.PROFILE }}-${{ github.sha }}
+          restore-keys: ccache-${{ env.PROFILE }}-
+
+      - name: Build (variável do repositório ATLAS_BUILD_CMD)
+        if: ${{ vars.ATLAS_BUILD_CMD != '' }}
+        working-directory: upstream
+        env:
+          ATLAS_PROFILE: ${{ env.PROFILE }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build ccache
+          export CCACHE_DIR="$HOME/.cache/ccache"
+          bash -c "${{ vars.ATLAS_BUILD_CMD }}"
+
+      - name: Aviso — comando de build ainda não definido
+        if: ${{ vars.ATLAS_BUILD_CMD == '' }}
+        run: echo "::notice::Defina a variável ATLAS_BUILD_CMD após ler o artefato atlas-inventory."
+
+      - name: Publicar APKs
+        if: ${{ vars.ATLAS_BUILD_CMD != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-apk-${{ env.PROFILE }}
+          path: upstream/**/*.apk
+          if-no-files-found: error
+          
