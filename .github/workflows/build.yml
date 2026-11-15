@@ -1,7 +1,7 @@
 name: Atlas Android Build
 
-# Pega QUALQUER .zip na raiz do repositório (o mais recente), extrai e usa como camada Atlas
-# (patches/, docs, scripts) sobre o porte do Blender para Android.
+# Pega QUALQUER .zip na raiz do repositório (o mais recente) como camada Atlas (patches/, docs)
+# e compila o porte Android do Blender seguindo o BUILDING.md do próprio porte.
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "Perfil (lite = leve, full = Cycles/USD/vídeo etc.)"
+        description: "Perfil (lite = mais leve; full = Cycles/USD/vídeo etc.)"
         type: choice
         options: [lite, full]
         default: lite
@@ -17,7 +17,7 @@ on:
         description: "Branch/tag/commit do upstream (fixe um commit p/ build reprodutível)"
         default: android
       build_cmd:
-        description: "Comando de build (vazio = só inventário). Roda dentro da pasta do upstream."
+        description: "Opcional: comando próprio de build (vazio = build_apk.sh do porte)"
         default: ""
 
 env:
@@ -25,6 +25,8 @@ env:
   PROFILE: ${{ inputs.profile || 'lite' }}
   UPSTREAM_REF: ${{ inputs.upstream_ref || 'android' }}
   BUILD_CMD: ${{ inputs.build_cmd || vars.ATLAS_BUILD_CMD }}
+  NDK_VER: "30.0.14904198-beta1"
+  LFS_BLENDER: https://projects.blender.org/blender/blender.git/info/lfs
 
 jobs:
   build:
@@ -37,17 +39,18 @@ jobs:
       - name: Localizar e extrair o .zip (qualquer nome)
         run: |
           ZIP=$(ls -t ./*.zip 2>/dev/null | head -1 || true)
-          if [ -z "$ZIP" ]; then echo "::error::Nenhum .zip na raiz do repositório. Envie o zip do projeto."; exit 1; fi
+          if [ -z "$ZIP" ]; then echo "::error::Nenhum .zip na raiz do repositório."; exit 1; fi
           echo "Usando: $ZIP"
           rm -rf atlas_src && mkdir atlas_src && unzip -q -o "$ZIP" -d atlas_src
           MARK=$(find atlas_src -name ATLAS-Contexto.md | head -1 || true)
           if [ -n "$MARK" ]; then ROOT=$(dirname "$MARK"); else ROOT=atlas_src; fi
           echo "ATLAS_ROOT=$(realpath "$ROOT")" >> "$GITHUB_ENV"
-          echo "Raiz do projeto Atlas: $ROOT"; ls "$ROOT"
+          mkdir -p inventory
 
       - name: Liberar espaço em disco
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL /usr/local/lib/node_modules /opt/microsoft /opt/az || true
           sudo docker image prune --all --force || true
           df -h /
 
@@ -57,48 +60,55 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Instalar NDK r30+ (o mais novo disponível)
+      - name: Dependências do host (GCC 14+, Ninja, patchelf, git-lfs, ccache)
         run: |
-          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
-          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SM" --licenses >/dev/null || true
-          NDK=$("$SM" --list 2>/dev/null | grep -o 'ndk;[0-9.]*' | sort -V | tail -1)
-          echo "NDK escolhido: $NDK"
-          case "$NDK" in ndk\;3[0-9]*|ndk\;[4-9][0-9]*) ;; *) echo "::error::NDK r30+ não encontrado ($NDK)"; exit 1;; esac
-          "$SM" "$NDK"
-          echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$SDK/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf zip unzip git-lfs ccache python3 curl
+          sudo apt-get install -y gcc-14 g++-14 || sudo apt-get install -y gcc-15 g++-15
+          cmake --version | head -1; gcc-14 --version 2>/dev/null | head -1 || gcc-15 --version | head -1
+          git lfs install
 
-      - name: Clonar upstream (com submódulos; LFS tolerante)
-        env:
-          GIT_LFS_SKIP_SMUDGE: "1"
+      - name: Android SDK + NDK exatos do porte
         run: |
-          mkdir -p inventory
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          # env.sh do porte espera o SDK em $HOME/android-sdk
+          [ -e "$HOME/android-sdk" ] || ln -s "$SDK" "$HOME/android-sdk"
+          yes | "$SM" --licenses >/dev/null || true
+          PKGS=("ndk;$NDK_VER" "platform-tools" "build-tools;35.0.1" "platforms;android-35")
+          "$SM" "${PKGS[@]}" || "$SM" --channel=3 "${PKGS[@]}" || sudo "$SM" --channel=3 "${PKGS[@]}"
+          ls "$HOME/android-sdk/ndk" "$HOME/android-sdk/build-tools"
+          test -d "$HOME/android-sdk/ndk/$NDK_VER"
+
+      - name: Clonar upstream
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"   # o LFS do GitHub (mirror) dá 404; usamos o servidor do Blender abaixo
+        run: |
           git clone "$UPSTREAM_REPO" upstream
           cd upstream
           git checkout "$UPSTREAM_REF"
-          git submodule update --init --recursive --depth 1
           git rev-parse HEAD | tee ../UPSTREAM_COMMIT.txt
-          { echo "== .lfsconfig"; cat .lfsconfig 2>/dev/null || echo "(nenhum)"; echo; echo "== git lfs env"; git lfs env 2>&1; } > ../inventory/lfs-config.txt || true
+          cp ../UPSTREAM_COMMIT.txt ../inventory/
 
-      - name: Baixar objetos LFS necessários (sem tests/)
+      - name: LFS do projeto Blender (sem tests/)
         working-directory: upstream
         run: |
-          INC="release/*,assets/*,scripts/*,doc/*"
-          echo "== tentativa 1: servidor LFS padrão =="
-          GIT_LFS_SKIP_SMUDGE=0 git lfs pull --include="$INC" 2>&1 | tail -15 || true
-          MISSING=$(git lfs ls-files | grep -E ' - (release|assets|scripts)/' | wc -l || true)
-          echo "ausentes após tentativa 1: $MISSING"
-          if [ "$MISSING" -gt 0 ]; then
-            echo "== tentativa 2: servidor LFS do projeto Blender =="
-            git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-            GIT_LFS_SKIP_SMUDGE=0 git lfs pull --include="$INC" 2>&1 | tail -15 || true
-            MISSING=$(git lfs ls-files | grep -E ' - (release|assets|scripts)/' | wc -l || true)
-            echo "ausentes após tentativa 2: $MISSING"
-          fi
-          git lfs ls-files > ../inventory/lfs-files.txt 2>&1 || true
+          # sem terminal: credenciais vazias, só para esse host (conteúdo público)
+          git config --global credential.https://projects.blender.org.helper '!f() { echo username=; echo password=; }; f'
+          git config lfs.url "$LFS_BLENDER"
+          GIT_LFS_SKIP_SMUDGE=0 git lfs pull --include="release/*,assets/*,scripts/*,doc/*" 2>&1 | tail -15
           git lfs ls-files | grep -E ' - (release|assets|scripts)/' > ../inventory/lfs-missing-needed.txt || true
-          echo "MISSING_NEEDED=$MISSING" >> "$GITHUB_ENV"
+          echo "LFS necessários ausentes: $(wc -l < ../inventory/lfs-missing-needed.txt)"
+          test ! -s ../inventory/lfs-missing-needed.txt
+
+      - name: Bibliotecas pré-compiladas (lib/android_arm64 + lib/linux_x64)
+        working-directory: upstream
+        run: |
+          (git submodule update --init --depth 1 lib/android_arm64 || git submodule update --init lib/android_arm64)
+          (git -c submodule.lib/linux_x64.update=checkout submodule update --init --depth 1 lib/linux_x64 \
+            || git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64)
+          du -sh lib/android_arm64 lib/linux_x64 || true
+          df -h /
 
       - name: Aplicar patches Atlas (do .zip)
         run: |
@@ -109,55 +119,64 @@ jobs:
           done
           echo "patches concluídos."
 
-      - name: Inventário de build (docs/scripts do porte)
+      - name: Vulkan headers (não vêm no conjunto pré-compilado)
         run: |
-          mkdir -p inventory
-          cp UPSTREAM_COMMIT.txt inventory/
-          cd upstream
-          { echo "## arquivos android relevantes"; \
-            find . -ipath '*android*' \( -name '*.md' -o -name '*.sh' -o -name 'CMakeLists.txt' -o -name 'build.gradle*' -o -name 'settings.gradle*' -o -name '*.yml' \) \
-              -not -path './lib/*' -not -path './.git/*' | head -200; } > ../inventory/android-files.txt
-          ls .github/workflows 2>/dev/null > ../inventory/upstream-workflows.txt || true
-          for f in README.md ANDROID*.md android/README.md; do [ -f "$f" ] && { echo "=== $f"; cat "$f"; } >> ../inventory/android-docs.txt; done || true
-          cat .github/workflows/*android* >> ../inventory/upstream-android-workflow.txt 2>/dev/null || true
-          for f in build_files/android/README.md build_files/android/BUILDING.md build_files/android/env.sh build_files/android/configure.sh build_files/android/build_apk.sh build_files/android/apk/package.sh; do
-            [ -f "$f" ] && { echo; echo "=================== $f"; head -c 30000 "$f"; } >> ../inventory/android-build-docs.txt
-          done || true
+          VER=$(grep -oE 'VULKAN_VERSION[^0-9]*[0-9]+\.[0-9]+\.[0-9]+' upstream/build_files/build_environment/cmake/versions.cmake | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          VER="${VER:-1.4.341}"
+          echo "Vulkan-Headers $VER"
+          curl -fL -o /tmp/vh.tar.gz "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v$VER.tar.gz"
+          tar -xzf /tmp/vh.tar.gz -C /tmp
+          mkdir -p blender_build_android/lib/vulkan_headers
+          cp -R "/tmp/Vulkan-Headers-$VER/include" blender_build_android/lib/vulkan_headers/include
 
-      - name: Publicar inventário
+      - name: Restaurar cache do compilador (ccache)
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ env.PROFILE }}-${{ github.run_id }}
+          restore-keys: ccache-${{ env.PROFILE }}-
+
+      - name: Build do APK (pode levar horas)
+        id: build
+        timeout-minutes: 320   # sobra tempo para salvar o cache e os logs mesmo se estourar
+        working-directory: upstream
+        env:
+          CCACHE_DIR: ~/.cache/ccache
+          CCACHE_MAXSIZE: 6G
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          export CCACHE_DIR="$HOME/.cache/ccache"; mkdir -p "$CCACHE_DIR"
+          CMD="${BUILD_CMD:-bash build_files/android/build_apk.sh $PROFILE}"
+          echo "Executando: $CMD"
+          bash -c "$CMD" 2>&1 | tee ../build.log
+          ccache -s || true
+
+      - name: Salvar cache do compilador
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ env.PROFILE }}-${{ github.run_id }}
+
+      - name: Resumo do build (últimas linhas)
+        if: always()
+        run: |
+          [ -f build.log ] && tail -n 300 build.log > inventory/build-tail.txt || true
+          find blender_build_android -name '*.apk' -exec ls -la {} \; > inventory/apk-list.txt 2>&1 || true
+          df -h / > inventory/disk.txt
+
+      - name: Publicar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-apk-${{ env.PROFILE }}
+          path: blender_build_android/android_apk_stage_*/*.apk
+          if-no-files-found: error
+
+      - name: Publicar logs/inventário
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: atlas-inventory
           path: inventory/
-
-      - name: ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ccache-${{ env.PROFILE }}-${{ github.sha }}
-          restore-keys: ccache-${{ env.PROFILE }}-
-
-      - name: Build (input build_cmd ou variável ATLAS_BUILD_CMD)
-        if: ${{ env.BUILD_CMD != '' }}
-        working-directory: upstream
-        env:
-          ATLAS_PROFILE: ${{ env.PROFILE }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y ninja-build ccache
-          export CCACHE_DIR="$HOME/.cache/ccache"
-          echo "Executando: $BUILD_CMD"
-          bash -c "$BUILD_CMD"
-
-      - name: Aviso — comando de build não informado
-        if: ${{ env.BUILD_CMD == '' }}
-        run: echo "::notice::Rode de novo informando build_cmd (ou defina ATLAS_BUILD_CMD). Veja atlas-inventory/android-build-docs.txt."
-
-      - name: Publicar APKs
-        if: ${{ env.BUILD_CMD != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: atlas-apk-${{ env.PROFILE }}
-          path: upstream/**/*.apk
-          if-no-files-found: error
           
