@@ -151,6 +151,7 @@ jobs:
         id: build
         timeout-minutes: 320   # sobra tempo para salvar o cache e os logs mesmo se estourar
         working-directory: upstream
+        shell: bash            # bash -eo pipefail: sem isso o "| tee" escondia a falha do build
         env:
           CCACHE_DIR: ~/.cache/ccache
           CCACHE_MAXSIZE: 6G
@@ -169,6 +170,17 @@ jobs:
         with:
           path: ~/.cache/ccache
           key: ccache-${{ env.PROFILE }}-${{ github.run_id }}
+
+      - name: Mostrar o fim do log de build (na tela, sem baixar artefato)
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            echo "===== ÚLTIMAS 60 LINHAS DO BUILD ====="; tail -n 60 build.log
+            MSG=$(tail -n 25 build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A",$0}' | head -c 3500)
+            echo "::error title=Build falhou - ultimas linhas::$MSG"
+          else
+            echo "build.log não existe: a falha foi ANTES do passo de build."
+          fi
 
       - name: Resumo do build (últimas linhas)
         if: always()
